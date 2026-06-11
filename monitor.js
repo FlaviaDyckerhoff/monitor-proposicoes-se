@@ -1,12 +1,16 @@
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const fs = require('fs');
+const dns = require('dns');
+const { spawnSync } = require('child_process');
 const nodemailer = require('nodemailer');
+
+dns.setDefaultResultOrder('ipv4first');
 
 const EMAIL_DESTINO = process.env.EMAIL_DESTINO;
 const EMAIL_REMETENTE = process.env.EMAIL_REMETENTE;
 const EMAIL_SENHA = process.env.EMAIL_SENHA;
 const ARQUIVO_ESTADO = 'estado.json';
-const URL_BASE = 'https://aleselegis.al.se.leg.br/spl/consulta-producao.aspx';
+const URL_BASE = 'http://aleselegis.al.se.leg.br/spl/consulta-producao.aspx';
 const ANO = new Date().getFullYear();
 const ITENS_POR_PAGINA = 50;
 const MAX_PAGINAS_PRIMEIRO_RUN = 10; // 500 proposições no backlog inicial
@@ -156,11 +160,76 @@ async function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+async function fetchComTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    console.log(`⚠️ fetch falhou (${err.message}); tentando fallback curl...`);
+    return fetchComCurl(url, options, timeoutMs);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function fetchComCurl(url, options = {}, timeoutMs = 30000) {
+  const args = ['-k', '-L', '-sS', '-D', '-', '--max-time', String(Math.ceil(timeoutMs / 1000)), url];
+  const headers = options.headers || {};
+  for (const [nome, valor] of Object.entries(headers)) {
+    if (String(nome).toLowerCase() === 'accept-encoding') continue;
+    if (valor !== undefined && valor !== null) args.splice(args.length - 1, 0, '-H', `${nome}: ${valor}`);
+  }
+
+  let input = undefined;
+  if (options.method && options.method.toUpperCase() !== 'GET') {
+    args.splice(args.length - 1, 0, '-X', options.method.toUpperCase(), '--data-binary', '@-');
+    input = String(options.body || '');
+  }
+
+  const res = spawnSync('curl', args, {
+    input,
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+  });
+
+  if (res.error) throw res.error;
+  if (res.status !== 0) {
+    throw new Error(`curl falhou com exit ${res.status}: ${res.stderr || res.stdout}`);
+  }
+
+  const bruto = res.stdout || '';
+  const partes = bruto.split(/\r?\n\r?\n/);
+  const body = partes.pop() || '';
+  const headerText = partes.pop() || '';
+  const statusMatch = headerText.match(/HTTP\/\S+\s+(\d+)/);
+  const status = statusMatch ? Number(statusMatch[1]) : 200;
+  const headerLines = headerText.split(/\r?\n/).slice(1);
+  const mapaHeaders = new Map();
+  for (const linha of headerLines) {
+    const idx = linha.indexOf(':');
+    if (idx > 0) mapaHeaders.set(linha.slice(0, idx).toLowerCase(), linha.slice(idx + 1).trim());
+  }
+
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get(nome) {
+        return mapaHeaders.get(String(nome).toLowerCase()) || null;
+      },
+    },
+    async text() {
+      return body;
+    },
+  };
+}
+
 async function carregarPaginaInicial() {
   const url = `${URL_BASE}?ano=${ANO}&ano_proposicao=${ANO}`;
   console.log(`📥 Carregando página inicial: ${url}`);
   
-  const resp = await fetch(url, {
+  const resp = await fetchComTimeout(url, {
     headers: { ...HEADERS_BASE, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
   });
 
@@ -217,7 +286,7 @@ async function mudarPara50Itens(estado) {
     '__ASYNCPOST': 'true',
   });
 
-  const resp = await fetch(`${URL_BASE}?ano=${ANO}&ano_proposicao=${ANO}`, {
+  const resp = await fetchComTimeout(`${URL_BASE}?ano=${ANO}&ano_proposicao=${ANO}`, {
     method: 'POST',
     headers: {
       ...HEADERS_BASE,
@@ -273,7 +342,7 @@ async function buscarPagina(numeroPagina, estadoAtual) {
     '__ASYNCPOST': 'true',
   });
 
-  const resp = await fetch(`${URL_BASE}?ano=${ANO}&ano_proposicao=${ANO}`, {
+  const resp = await fetchComTimeout(`${URL_BASE}?ano=${ANO}&ano_proposicao=${ANO}`, {
     method: 'POST',
     headers: {
       ...HEADERS_BASE,
@@ -310,6 +379,18 @@ async function buscarPagina(numeroPagina, estadoAtual) {
 async function buscarProposicoes(idsVistos, primeiroRun) {
   // 1. Carrega página inicial (10 itens/pág)
   const inicial = await carregarPaginaInicial();
+
+  if (!primeiroRun) {
+    const novasNaPaginaInicial = inicial.proposicoesPag1.filter(p => !idsVistos.has(p.id));
+    if (novasNaPaginaInicial.length === 0) {
+      console.log('✅ Nenhuma novidade na página inicial. Parando.');
+      return [];
+    }
+
+    console.log(`🆕 Novidades na página inicial: ${novasNaPaginaInicial.length}. Enviando sem paginar.`);
+    return novasNaPaginaInicial;
+  }
+
   await sleep(1500);
 
   // 2. Muda para 50 itens por página
@@ -317,15 +398,6 @@ async function buscarProposicoes(idsVistos, primeiroRun) {
   await sleep(1500);
 
   const todasProposicoes = [...estadoAtual.proposicoes];
-  
-  // Se não é primeiro run, verifica se já viu todas da primeira página
-  if (!primeiroRun) {
-    const novasNaPag1 = estadoAtual.proposicoes.filter(p => !idsVistos.has(p.id));
-    if (novasNaPag1.length === 0) {
-      console.log('✅ Nenhuma novidade na primeira página. Parando.');
-      return todasProposicoes.filter(p => !idsVistos.has(p.id));
-    }
-  }
 
   // 3. Itera pelas próximas páginas
   // No primeiro run: até MAX_PAGINAS, nos demais: para quando não houver novidades
@@ -463,7 +535,7 @@ async function enviarEmail(novas) {
         <tbody>${linhas}</tbody>
       </table>
       <p style="margin-top:20px;font-size:12px;color:#999">
-        Acesse: <a href="https://aleselegis.al.se.leg.br/spl/consulta-producao.aspx?ano=${ANO}&ano_proposicao=${ANO}">Portal da Assembleia Legislativa de Sergipe</a>
+        Acesse: <a href="http://aleselegis.al.se.leg.br/spl/consulta-producao.aspx?ano=${ANO}&ano_proposicao=${ANO}">Portal da Assembleia Legislativa de Sergipe</a>
       </p>
     </div>
   `;
