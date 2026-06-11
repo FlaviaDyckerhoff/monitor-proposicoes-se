@@ -3,7 +3,6 @@ name: Monitor Proposicoes SE
 on:
   schedule:
     - cron: '22 12 * * 1-5'
-    - cron: '22 20 * * 1-5'
   workflow_dispatch:
 
 jobs:
