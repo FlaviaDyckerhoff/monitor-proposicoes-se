@@ -1,0 +1,10 @@
+const assert=require('assert');const {collectComplete}=require('./consulta_producao_complete');
+function page(n,total,size,rowsOverride) {const rows=rowsOverride || Array.from({length:Math.min(size,total-(n-1)*size)},(_,i)=>'ID:'+(1000+(n-1)*size+i));return '<input name="__VIEWSTATE" value="opaque"><select name="ctl00$ContentPlaceHolder1$ddl_ItensExibidos"><option selected="selected" value="'+size+'">'+size+'</option></select>Localizada(s) <strong>'+total+'</strong><a href="javascript:__doPostBack(&#39;ctl00$ContentPlaceHolder1$lbNext&#39;,&#39;&#39;)">Próxima</a>'+rows.join(';');}
+function fake({total=21,size=2,failPage,repeat=false,truncate=false,changing=false}) {let n=0;return async (_url,opts)=>{if(opts.method==='GET')return response(page(1,total,10));const d=new URLSearchParams(opts.body);if(d.get('__EVENTTARGET').endsWith('$ddl_ItensExibidos'))n=1;else n++;if(n===failPage)throw Error('network');return response(page(repeat?1:n,changing && n===2?total+1:total,size,truncate && n===2?['ID:999']:undefined));};}
+function response(html){return {ok:true,headers:{get(){return '';},getSetCookie(){return [];}},text:async()=>html};}
+const parse=h=>[...h.matchAll(/ID:(\d+)/g)].map(m=>({id:m[1]}));
+(async()=>{let checks=0;const full=await collectComplete({url:'https://example.invalid',parse,fetchImpl:fake({}),pageSize:2});assert.equal(full.coverage.pages,11);assert.equal(full.items.length,21);checks++;
+for (const opt of [{failPage:2},{repeat:true},{truncate:true},{changing:true}]){await assert.rejects(()=>collectComplete({url:'https://example.invalid',parse,fetchImpl:fake(opt),pageSize:2}));checks++;}
+await assert.rejects(()=>collectComplete({url:'https://example.invalid',parse,fetchImpl:fake({}),pageSize:2,maxPages:2}));checks++;
+await assert.rejects(()=>collectComplete({url:'https://example.invalid',parse,fetchImpl:async()=>response('<html>erro oculto</html>')}));checks++;
+console.log('PASS',checks,'checks: 11 páginas, falha parcial, repetição, truncamento, total mutante, limite e erro HTML.');})().catch(e=>{console.error(e);process.exitCode=1;});

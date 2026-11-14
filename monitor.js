@@ -1,4 +1,5 @@
 const mlPropsPriority = require('./priority_terms');
+const { collectComplete } = require('./consulta_producao_complete');
 
 const FICHA_URL = process.env.FICHA_URL || 'https://doe.monitorlegislativo.com.br/ficha';
 
@@ -48,7 +49,7 @@ const CONTROLE03_API_USER = process.env.CONTROLE03_API_USER || '';
 const CONTROLE03_API_PASS = process.env.CONTROLE03_API_PASS || '';
 const CONTROLE03_BASIC_AUTH = process.env.CONTROLE03_BASIC_AUTH || '';
 
-const URL_BASE = 'http://aleselegis.al.se.leg.br/spl/consulta-producao.aspx';
+const URL_BASE = 'https://aleselegis.al.se.leg.br/spl/consulta-producao.aspx';
 const ANO = new Date().getFullYear();
 const ITENS_POR_PAGINA = 50;
 const MAX_PAGINAS_PRIMEIRO_RUN = 10; // 500 proposições no backlog inicial
@@ -414,58 +415,17 @@ async function buscarPagina(numeroPagina, estadoAtual) {
 
 // ─── Lógica principal ────────────────────────────────────────────────────────
 
-async function buscarProposicoes(idsVistos, primeiroRun) {
-  // 1. Carrega página inicial (10 itens/pág)
-  const inicial = await carregarPaginaInicial();
-
-  if (!primeiroRun) {
-    const novasNaPaginaInicial = inicial.proposicoesPag1.filter(p => !idsVistos.has(p.id));
-    if (novasNaPaginaInicial.length === 0) {
-      console.log('✅ Nenhuma novidade na página inicial. Parando.');
-      return [];
-    }
-
-    console.log(`🆕 Novidades na página inicial: ${novasNaPaginaInicial.length}. Enviando sem paginar.`);
-    return novasNaPaginaInicial;
-  }
-
-  await sleep(1500);
-
-  // 2. Muda para 50 itens por página
-  let estadoAtual = await mudarPara50Itens(inicial);
-  await sleep(1500);
-
-  const todasProposicoes = [...estadoAtual.proposicoes];
-
-  // 3. Itera pelas próximas páginas
-  // No primeiro run: até MAX_PAGINAS, nos demais: para quando não houver novidades
-  const totalPaginas = Math.ceil(inicial.total / ITENS_POR_PAGINA);
-  const maxPag = primeiroRun ? Math.min(MAX_PAGINAS_PRIMEIRO_RUN, totalPaginas) : totalPaginas;
-
-  for (let pag = 2; pag <= maxPag; pag++) {
-    console.log(`📄 Buscando página ${pag}/${maxPag}...`);
-    await sleep(2000);
-
-    try {
-      estadoAtual = await buscarPagina(pag, estadoAtual);
-      console.log(`   → ${estadoAtual.proposicoes.length} proposições`);
-      todasProposicoes.push(...estadoAtual.proposicoes);
-
-      // Se não é primeiro run, para quando não houver novidades na página
-      if (!primeiroRun) {
-        const novas = estadoAtual.proposicoes.filter(p => !idsVistos.has(p.id));
-        if (novas.length === 0) {
-          console.log(`✅ Sem novidades na página ${pag}. Parando.`);
-          break;
-        }
-      }
-    } catch (err) {
-      console.error(`❌ Erro na página ${pag}: ${err.message}`);
-      break;
-    }
-  }
-
-  return todasProposicoes.filter(p => !idsVistos.has(p.id));
+async function buscarProposicoes(idsVistos, _primeiroRun) {
+  const { items, coverage } = await collectComplete({
+    url: `${URL_BASE}?ano=${ANO}&ano_proposicao=${ANO}`,
+    parse: parseProposicoes,
+    fetchImpl: fetchComTimeout,
+    maxPages: 1000,
+    onPage: ({page, expectedPages, count, total}) => console.log(`Fonte SE: página ${page}/${expectedPages}, ${count} itens, total ${total}`),
+  });
+  console.log('Cobertura SE comprovada: ' + JSON.stringify(coverage));
+  // Conhecidos não são fronteira segura: a listagem mistura tipos e pode receber retroativos.
+  return items.filter(p => !idsVistos.has(String(p.id)));
 }
 
 // ─── Email ───────────────────────────────────────────────────────────────────
@@ -796,7 +756,7 @@ async function sincronizarRadar03(novas) {
     if (!postResp.ok) throw new Error('POST ' + postResp.status);
     console.log('✅ Radar 03 sincronizado: ' + CASA_RADAR03 + ' · ' + resumo.map(item => item.tipo + ' ' + item.numero + '/' + item.ano).join(' | '));
   } catch (err) {
-    console.warn('⚠️ Não foi possível sincronizar o Radar 03 automaticamente: ' + err.message);
+    throw new Error('Entrega Radar 03 não confirmada: ' + err.message);
   }
 }
 
